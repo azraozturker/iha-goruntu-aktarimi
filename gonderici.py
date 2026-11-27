@@ -1,5 +1,6 @@
-import socket   # Telemetri paketlerini UDP ile göndermek için
-import time     # Zaman damgası ve FPS için
+import socket      # Telemetri ve eko paketleri için (UDP)
+import threading   # YENİ: Eko paketlerini ayrı bir işçide dinlemek için
+import time        # Zaman damgası, FPS ve gecikme için
 import cv2
 
 import ortak                              # Ortak kurallar (IP, port, boru hattı)
@@ -46,6 +47,40 @@ if not video.isOpened():
 # ---------------- TELEMETRİ SOKETİ ----------------
 telemetri_soketi = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
+# ---------------- YENİ: EKO DİNLEYİCİ (gecikme ölçümü) ----------------
+eko_soketi = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+eko_soketi.bind(("0.0.0.0", ortak.EKO_PORT))   # 5001 numaralı portu dinle
+eko_soketi.settimeout(0.5)                      # En fazla 0,5 saniye bekle
+
+gecikme_ms = 0.0     # Ekranda gösterilecek tek yön gecikme (milisaniye)
+calisiyor = True     # Program kapanınca işçiyi durdurmak için
+
+
+def eko_dinle():
+    """Alıcıdan gelen eko paketlerini dinler, gecikmeyi hesaplar."""
+    global gecikme_ms
+    while calisiyor:
+        try:
+            veri, _ = eko_soketi.recvfrom(1024)
+        except socket.timeout:      # 0,5 sn içinde paket gelmediyse tekrar dene
+            continue
+        except OSError:             # Soket kapatıldıysa çık
+            break
+
+        paket = ortak.telemetri_coz(veri)
+        gidis_donus_ms = (time.time() - paket["zaman"]) * 1000
+        yeni = gidis_donus_ms / 2   # Tek yön ≈ gidiş-dönüşün yarısı
+
+        # Sayı zıplamasın diye yumuşat: eskinin %90'ı + yeninin %10'u
+        if gecikme_ms == 0:
+            gecikme_ms = yeni
+        else:
+            gecikme_ms = 0.9 * gecikme_ms + 0.1 * yeni
+
+
+eko_isci = threading.Thread(target=eko_dinle, daemon=True)
+eko_isci.start()
+
 print("Gönderim başladı →", ortak.YER_IP)
 
 # ---------------- ANA DÖNGÜ ----------------
@@ -62,7 +97,7 @@ while True:
         break
 
     kare_no += 1
-    zaman = time.time()      # Bu karenin çekildiği an (gecikme ölçümünde kullanacağız)
+    zaman = time.time()      # Bu karenin çekildiği an (gecikme ölçümünde kullanılıyor)
 
     # 1) QR'ı büyük ve temiz karede çöz
     if kare_no % QR_ARALIGI == 0:
@@ -89,17 +124,23 @@ while True:
         fps = kare_sayaci / gecen_sure
         kare_sayaci = 0
         saniye_basi = time.time()
+        print(f"FPS: {fps:.1f} | Gecikme: {gecikme_ms:.1f} ms")   # YENİ
 
     # 6) Önizleme: İHA tarafında ne gönderildiğini görmek için
     onizleme = kucuk.copy()
     qr_ciz(onizleme, gonderilecek_qr)
     cv2.putText(onizleme, f"FPS: {fps:.1f}", (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    cv2.putText(onizleme, f"Gecikme: {gecikme_ms:.1f} ms", (10, 65),     # YENİ
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
     cv2.imshow("IHA - gonderilen", onizleme)
 
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
+# ---------------- KAPATMA ----------------
+calisiyor = False            # YENİ: Eko işçisini durdur
+eko_soketi.close()           # YENİ
 kamera.release()
 video.release()
 telemetri_soketi.close()
